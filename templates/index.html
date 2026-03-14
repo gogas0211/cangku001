@@ -287,35 +287,93 @@ function buildScoringPrompt(posts, inp) {
 async function callGemini(prompt) {
   var apiKey = document.getElementById('apiKey').value.trim();
   localStorage.setItem('xhs_api_key', apiKey);
-  var resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=' + apiKey, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      contents: [{parts: [{text: prompt}]}],
-      generationConfig: {maxOutputTokens: 4000, temperature: 1.0}
-    })
-  });
+
+  var resp = await fetch(
+    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=' + apiKey,
+    {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        contents: [{parts: [{text: prompt}]}],
+        generationConfig: {maxOutputTokens: 4000, temperature: 1.0}
+      })
+    }
+  );
+
   if (!resp.ok) {
-    var err = await resp.json();
-    throw new Error(err.error ? err.error.message : '请求失败 ' + resp.status);
+    var err = await resp.json().catch(function () { return null; });
+    throw new Error(err && err.error ? err.error.message : '请求失败 ' + resp.status);
   }
+
   var data = await resp.json();
+
+  if (
+    !data ||
+    !data.candidates ||
+    !data.candidates[0] ||
+    !data.candidates[0].content ||
+    !data.candidates[0].content.parts ||
+    !data.candidates[0].content.parts[0] ||
+    !data.candidates[0].content.parts[0].text
+  ) {
+    console.error('Gemini 原始返回：', data);
+    throw new Error('AI 返回内容为空，请重试');
+  }
+
   var raw = data.candidates[0].content.parts[0].text;
-  var text = raw.replace(/```json/g,'').replace(/```/g,'').trim();
-  var start = text.indexOf('{');
-  var end = text.lastIndexOf('}');
-  if (start === -1 || end === -1) throw new Error('AI返回格式异常，请重试');
-  text = text.substring(start, end + 1);
+  var text = raw
+    .replace(/```json/gi, '')
+    .replace(/```/g, '')
+    .trim();
+
+  var startObj = text.indexOf('{');
+  var endObj = text.lastIndexOf('}');
+  var startArr = text.indexOf('[');
+  var endArr = text.lastIndexOf(']');
+
+  if (startObj !== -1 && endObj !== -1 && endObj > startObj) {
+    text = text.substring(startObj, endObj + 1).trim();
+  } else if (startArr !== -1 && endArr !== -1 && endArr > startArr) {
+    text = text.substring(startArr, endArr + 1).trim();
+  } else {
+    console.error('AI 原始文本：', raw);
+    throw new Error('AI返回格式异常，请重试');
+  }
+
+  function tryParse(str) {
+    return JSON.parse(str);
+  }
+
   try {
-    return JSON.parse(text);
-  } catch(e) {
-    text = text.replace(/[\u0000-\u001F\u007F]/g, function(c) {
-      if (c === '\n') return '\\n';
-      if (c === '\r') return '\\r';
-      if (c === '\t') return '\\t';
-      return '';
-    });
-    return JSON.parse(text);
+    return tryParse(text);
+  } catch (e1) {
+    try {
+      var fixed = text
+        .replace(/[“”]/g, '"')
+        .replace(/[‘’]/g, "'")
+        .replace(/,\s*([}\]])/g, '$1')
+        .replace(/[\u0000-\u001F\u007F]/g, function (c) {
+          if (c === '\n') return '\\n';
+          if (c === '\r') return '\\r';
+          if (c === '\t') return '\\t';
+          return '';
+        });
+
+      if (
+        fixed.indexOf("{'") === 0 ||
+        fixed.indexOf("[{'") === 0 ||
+        fixed.indexOf("{ '") === 0 ||
+        fixed.indexOf("[ { '") === 0
+      ) {
+        fixed = fixed.replace(/'/g, '"');
+      }
+
+      return tryParse(fixed);
+    } catch (e2) {
+      console.error('Gemini 原始文本：', raw);
+      console.error('截取后的文本：', text);
+      throw new Error('AI返回的不是合法JSON，请重试一次');
+    }
   }
 }
 
@@ -337,16 +395,22 @@ async function generate(count) {
   try {
     var inp = getInputs();
     var parsed = await callGemini(buildPrompt(count, inp));
+    if (!parsed || !Array.isArray(parsed.posts)) {
+      throw new Error('AI返回数据格式不正确');
+    }
     setStep(steps, 1);
     parsed.posts = parsed.posts.map(function(p) {
-      p._banned = checkBannedWords(p.title + p.opening + p.body + p.cta);
+      p._banned = checkBannedWords((p.title||'') + (p.opening||'') + (p.body||'') + (p.cta||''));
       return p;
     });
     setStep(steps, 2);
     saveHistory(inp.topic, selectedType, selectedAudience);
     renderResults(parsed.posts, null, null);
-  } catch(e) { showError('生成失败：' + e.message); }
-  finally { setLoading(false); }
+  } catch(e) {
+    showError('生成失败：' + e.message);
+  } finally {
+    setLoading(false);
+  }
 }
 
 async function generateBest() {
@@ -359,39 +423,54 @@ async function generateBest() {
   try {
     var inp = getInputs();
     var parsed = await callGemini(buildPrompt(10, inp));
+    if (!parsed || !Array.isArray(parsed.posts)) {
+      throw new Error('AI返回候选文案格式不正确');
+    }
     setStep(steps, 1);
     var scoring = await callGemini(buildScoringPrompt(parsed.posts, inp));
+    if (!scoring || !Array.isArray(scoring.scores) || typeof scoring.best_index !== 'number') {
+      throw new Error('AI评分结果格式不正确');
+    }
     setStep(steps, 2);
     parsed.posts = parsed.posts.map(function(p) {
-      p._banned = checkBannedWords(p.title + p.opening + p.body + p.cta);
+      p._banned = checkBannedWords((p.title||'') + (p.opening||'') + (p.body||'') + (p.cta||''));
       return p;
     });
     setStep(steps, 3);
     saveHistory(inp.topic, selectedType, selectedAudience);
     renderResults(parsed.posts, scoring.scores, scoring.best_index);
-  } catch(e) { showError('生成失败：' + e.message); }
-  finally { setLoading(false); }
+  } catch(e) {
+    showError('生成失败：' + e.message);
+  } finally {
+    setLoading(false);
+  }
 }
 
 function renderResults(posts, scores, bestIdx) {
   var box = document.getElementById('results');
   box.innerHTML = '';
-  if (scores !== null) {
+
+  if (scores !== null && typeof bestIdx === 'number' && posts[bestIdx]) {
     box.appendChild(makeCard(posts[bestIdx], true, scores[bestIdx], null));
+
     var showBtn = document.createElement('button');
     showBtn.className = 'show-all-btn';
     showBtn.textContent = '📋 查看全部10篇候选';
     box.appendChild(showBtn);
+
     var candSection = document.createElement('div');
     candSection.className = 'candidates-section';
+
     showBtn.onclick = function() {
       candSection.classList.toggle('open');
       showBtn.textContent = candSection.classList.contains('open') ? '收起候选文案' : '📋 查看全部10篇候选';
     };
+
     var sorted = scores.slice().sort(function(a,b){ return b.score - a.score; });
     sorted.forEach(function(s) {
       if (s.index === bestIdx) return;
       var p = posts[s.index];
+      if (!p) return;
       var c = document.createElement('div');
       c.className = 'candidate-card';
       c.innerHTML = '<div class="candidate-num">候选 ' + (s.index+1) + ' · ' + s.score + '分'
@@ -404,6 +483,7 @@ function renderResults(posts, scores, bestIdx) {
       };
       candSection.appendChild(c);
     });
+
     box.appendChild(candSection);
   } else {
     posts.forEach(function(p, i) {
@@ -415,28 +495,30 @@ function renderResults(posts, scores, bestIdx) {
 function makeCard(post, isBest, scoreObj, label) {
   var card = document.createElement('div');
   card.className = 'result-card show' + (isBest ? ' best' : '');
-  var tags = post.hashtags.map(function(t){ return '<span class="tag">' + (t.startsWith('#')?t:'#'+t) + '</span>'; }).join('');
-  var full = post.title + '\n\n' + post.opening + '\n\n' + post.body + '\n\n' + post.cta + '\n\n'
-    + post.hashtags.map(function(t){ return t.startsWith('#')?t:'#'+t; }).join(' ');
+  var hashtags = Array.isArray(post.hashtags) ? post.hashtags : [];
+  var tags = hashtags.map(function(t){ return '<span class="tag">' + (t.startsWith('#') ? t : '#' + t) + '</span>'; }).join('');
+  var full = (post.title || '') + '\n\n' + (post.opening || '') + '\n\n' + (post.body || '') + '\n\n' + (post.cta || '') + '\n\n'
+    + hashtags.map(function(t){ return t.startsWith('#') ? t : '#' + t; }).join(' ');
   var fullEsc = full.replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\n/g,'\\n');
 
   var bannedHtml = '';
   if (post._banned && post._banned.length > 0) {
-    bannedHtml = '<div class="warn-box show"><div class="warn-title">⚠️ 检测到违禁词，建议修改后发布</div>发现：' + post._banned.map(function(w){ return '<b>' + w + '</b>'; }).join('、') + '</div>';
+    bannedHtml = '<div class="warn-box show"><div class="warn-title">⚠️ 检测到违禁词，建议修改后发布</div>发现：'
+      + post._banned.map(function(w){ return '<b>' + w + '</b>'; }).join('、') + '</div>';
   }
 
   card.innerHTML = (isBest ? '<div class="best-badge">🏆 AI 评选最优</div>' : '')
     + (label ? '<div style="font-size:12px;color:#ff2442;font-weight:600;margin-bottom:10px;">' + label + '</div>' : '')
-    + (scoreObj ? '<div class="score-bar"><span class="score-label">爆款潜力</span><div class="score-track"><div class="score-fill" style="width:' + Math.min(scoreObj.score,100) + '%"></div></div><span class="score-num">' + scoreObj.score + '分</span></div><div class="score-reason">💡 ' + esc(scoreObj.reason) + '</div>' : '')
+    + (scoreObj ? '<div class="score-bar"><span class="score-label">爆款潜力</span><div class="score-track"><div class="score-fill" style="width:' + Math.min(scoreObj.score,100) + '%"></div></div><span class="score-num">' + scoreObj.score + '分</span></div><div class="score-reason">💡 ' + esc(scoreObj.reason || '') + '</div>' : '')
     + bannedHtml
     + '<div class="result-label">📌 标题</div>'
-    + '<div class="result-title">' + esc(post.title) + '</div>'
+    + '<div class="result-title">' + esc(post.title || '') + '</div>'
     + '<div class="result-label">🎯 开头</div>'
-    + '<div class="result-content">' + esc(post.opening) + '</div>'
+    + '<div class="result-content">' + esc(post.opening || '') + '</div>'
     + '<div class="result-label">📝 正文</div>'
-    + '<div class="result-content">' + esc(post.body) + '</div>'
+    + '<div class="result-content">' + esc(post.body || '') + '</div>'
     + '<div class="result-label">💬 互动引导</div>'
-    + '<div class="result-content">' + esc(post.cta) + '</div>'
+    + '<div class="result-content">' + esc(post.cta || '') + '</div>'
     + '<div class="result-label">🏷️ 话题标签</div>'
     + '<div class="hashtags">' + tags + '</div>'
     + '<button class="copy-btn" onclick="copyText(this,\'' + fullEsc + '\')">📋 一键复制全文</button>';
@@ -448,13 +530,18 @@ function copyText(btn, text) {
   navigator.clipboard.writeText(decoded).then(function() {
     btn.textContent = '✅ 已复制！';
     setTimeout(function(){ btn.textContent = '📋 一键复制全文'; }, 2000);
+  }).catch(function() {
+    btn.textContent = '复制失败，请手动复制';
+    setTimeout(function(){ btn.textContent = '📋 一键复制全文'; }, 2000);
   });
 }
 
 function saveHistory(topic, type, audience) {
   var history = JSON.parse(localStorage.getItem('xhs_history') || '[]');
   history.unshift({
-    topic: topic, type: type, audience: audience,
+    topic: topic,
+    type: type,
+    audience: audience,
     time: new Date().toLocaleString('zh-CN', {month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'})
   });
   if (history.length > 20) history = history.slice(0, 20);
@@ -505,16 +592,26 @@ function clearHistory() {
 }
 
 function esc(s) {
-  return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/'/g,'&#39;');
+  return String(s || '')
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/'/g,'&#39;')
+    .replace(/"/g,'&quot;');
 }
+
 function showError(msg) {
   var el = document.getElementById('error');
   el.textContent = msg;
   el.classList.add('show');
 }
+
 function setLoading(on) {
   document.getElementById('loading').classList.toggle('show', on);
-  ['btn1','btn3','btn10'].forEach(function(id){ document.getElementById(id).disabled = on; });
+  ['btn1','btn3','btn10'].forEach(function(id){
+    var btn = document.getElementById(id);
+    if (btn) btn.disabled = on;
+  });
 }
 </script>
 </body>
