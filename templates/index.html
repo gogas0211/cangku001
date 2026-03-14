@@ -428,27 +428,40 @@ async function generateBest() {
   setLoading(true);
   document.getElementById('error').classList.remove('show');
   document.getElementById('results').innerHTML = '';
-  var steps = ['正在生成10篇候选文案...', 'AI 正在评分...', '违禁词检测...', '选出最优版本...'];
+  var steps = ['正在生成第1批5篇...', '正在生成第2批5篇...', 'AI 正在评分...', '违禁词检测...', '选出最优版本...'];
   setStep(steps, 0);
   try {
     var inp = getInputs();
-    var parsed = await callGemini(buildPrompt(10, inp));
-    if (!parsed || !Array.isArray(parsed.posts)) {
-      throw new Error('AI返回候选文案格式不正确');
-    }
+
+    // 分两批各生成5篇，避免超出token限制
+    var batch1 = await callGemini(buildPrompt(5, inp));
+    if (!batch1 || !Array.isArray(batch1.posts)) throw new Error('第1批生成失败，请重试');
     setStep(steps, 1);
-    var scoring = await callGemini(buildScoringPrompt(parsed.posts, inp));
-    if (!scoring || !Array.isArray(scoring.scores) || typeof scoring.best_index !== 'number') {
-      throw new Error('AI评分结果格式不正确');
-    }
+
+    var batch2 = await callGemini(buildPrompt(5, inp));
+    if (!batch2 || !Array.isArray(batch2.posts)) throw new Error('第2批生成失败，请重试');
     setStep(steps, 2);
-    parsed.posts = parsed.posts.map(function(p) {
+
+    var allPosts = batch1.posts.concat(batch2.posts);
+
+    var scoring = await callGemini(buildScoringPrompt(allPosts, inp));
+    if (!scoring || !Array.isArray(scoring.scores) || typeof scoring.best_index !== 'number') {
+      // 评分失败时降级处理：直接取第一篇
+      scoring = {
+        scores: allPosts.map(function(_, i){ return {index:i, score:80-i, reason:'AI评分暂时不可用'}; }),
+        best_index: 0
+      };
+    }
+    setStep(steps, 3);
+
+    allPosts = allPosts.map(function(p) {
       p._banned = checkBannedWords((p.title||'') + (p.opening||'') + (p.body||'') + (p.cta||''));
       return p;
     });
-    setStep(steps, 3);
+    setStep(steps, 4);
+
     saveHistory(inp.topic, selectedType, selectedAudience);
-    renderResults(parsed.posts, scoring.scores, scoring.best_index);
+    renderResults(allPosts, scoring.scores, scoring.best_index);
   } catch(e) {
     showError('生成失败：' + e.message);
   } finally {
