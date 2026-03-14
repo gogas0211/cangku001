@@ -270,35 +270,29 @@ function buildPrompt(count, inp) {
 }
 
 function buildScoringPrompt(posts, inp) {
-  var compactPosts = posts.map(function(p, i) {
-    return {
-      index: i,
-      title: p.title || "",
-      opening: (p.opening || "").slice(0, 120)
-    };
+  var lines = [
+    "你是小红书爆款内容评审专家，只返回JSON，不返回任何解释或markdown。",
+    "",
+    "产品：" + (inp.topic || ""),
+    "人群：" + selectedAudience,
+    "",
+    "以下是" + posts.length + "篇候选文案的标题和开头："
+  ];
+
+  posts.forEach(function(p, i) {
+    lines.push("版本" + i + "：" + (p.title || "") + " | " + (p.opening || "").slice(0, 80));
   });
 
-  return [
-    "你是小红书爆款内容评审专家。",
-    "请根据以下候选文案，选出最有爆款潜力的一篇。",
-    "",
-    "产品/主题：" + inp.topic,
-    "目标人群：" + selectedAudience,
-    "内容类型：" + selectedType,
-    "",
-    "评分标准：",
-    "1. 标题吸引力",
-    "2. 开头真实感",
-    "3. 情绪共鸣",
-    "4. 互动潜力",
-    "",
-    "你只能返回严格 JSON，不要返回任何解释、markdown、代码块。",
-    "返回格式必须是：",
-    '{"scores":[{"index":0,"score":0,"reason":""}],"best_index":0}',
-    "",
-    "候选文案：",
-    JSON.stringify(compactPosts)
-  ].join("\n");
+  var scoresTpl = posts.map(function(_, i) {
+    return '{"index":' + i + ',"score":0,"reason":"一句话理由"}';
+  }).join(",");
+
+  lines.push("");
+  lines.push("评分维度：标题吸引力、真实感、情感共鸣、互动潜力，总分100。");
+  lines.push("必须严格返回以下JSON格式，不要有任何多余文字：");
+  lines.push('{"scores":[' + scoresTpl + '],"best_index":0}');
+
+  return lines.join("\n");
 }
 async function callGemini(prompt) {
   var apiKey = document.getElementById('apiKey').value.trim();
